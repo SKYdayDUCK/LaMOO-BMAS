@@ -115,3 +115,92 @@ def test_standalone_import_has_no_campaign_or_torch_dependency(tmp_path):
     package = str(Path(__file__).resolve().parents[1])
     code = 'import sys; sys.path.insert(0,'+repr(package)+'); import pareto_search; assert "torch" not in sys.modules'
     subprocess.run([sys.executable,'-I','-c',code],cwd=tmp_path,check=True,capture_output=True)
+
+
+def test_priority_selects_one_configuration_and_guides_batches(tmp_path):
+    policy = dict(levels=[[0,1],[2,3]],weights=[.7,.3],reference=[100.,50.,100.,80.])
+    options = dict(space={'x':dict(low=0.,high=1.)}, objectives=['loss','latency','tail','p95'],
+                   priority=policy,budget=5,batch_size=4)
+    source = Optimizer(tmp_path/'source',**options)
+    points = source.ask(4)
+    values = [[90,60,70,60],[95,45,110,70],[99,49,99,79],[80,40,90,75]]
+    rows = [dict(candidate=p,objectives=source.objectives,minimize=True,
+                 per_seed=[dict(seed=s,values=v) for s in source.seeds]) for p,v in zip(points,values)]
+    source.tell('first',rows)
+    champion = source.representative()
+    assert champion['candidate'] == points[3]
+    assert champion['values'] == values[3]
+    assert champion['tier'] == 0 and champion['levels_passed'] == [True,True]
+    expected = .7*(.8/1.8)+.3*((75/80)/(1+75/80))
+    assert champion['score'] == pytest.approx(expected)
+    champion['values'][0] = -1000
+    assert source.representative()['values'] == values[3]
+    # History supplies observations while preserving the new-config budget.
+    warm = Optimizer(tmp_path/'warm',**options,history=rows)
+    proposed = warm.ask(4)
+    assert len(proposed) == 4
+    assert warm.state['rounds'][-1]['routes'] == [
+        'priority_partition_lcb','priority_partition_lcb','priority_global_lcb','global_exploration']
+    restored = Optimizer(tmp_path/'warm',**options,history=rows)
+    assert restored.ask(4) == proposed
+    assert restored.representative()['candidate'] == points[3]
+    changed = copy.deepcopy(options)
+    changed['priority']['weights'] = [.8,.2]
+    with pytest.raises(ValueError,match='Frozen'):
+        Optimizer(tmp_path/'warm',**changed,history=rows)
+
+
+def test_priority_tiers_precede_score_and_negative_values_keep_order(tmp_path):
+    s = Optimizer(tmp_path,space={'x':dict(low=0.,high=1.)},objectives=['quality','cost'],
+        priority=dict(levels=[[0],[1]],weights=[.7,.3],reference=[-.7,50.]))
+    points = s.ask(4)
+    values = [[-.99,100.],[-.8,40.],[-.9,40.],[-.6,1.]]
+    s.tell('batch',[dict(candidate=p,objectives=s.objectives,minimize=True,
+        per_seed=[dict(seed=seed,values=v) for seed in s.seeds]) for p,v in zip(points,values)])
+    assert s.representative()['values'] == [-.9,40.]
+
+
+@pytest.mark.parametrize('change',[
+    {'levels':[[0],[0]]}, {'weights':[.7,.7]}, {'reference':[1.]},
+    {'reducers':['sum','mean']}, {'required_levels':3}])
+def test_invalid_priority_is_rejected(tmp_path,change):
+    priority = dict(levels=[[0],[1]],weights=[.7,.3],reference=[1.,1.])
+    priority.update(change)
+    with pytest.raises(ValueError):
+        Optimizer(tmp_path,**config(),priority=priority)
+
+
+def test_default_protocol_remains_compatible(tmp_path):
+    s = Optimizer(tmp_path,**config())
+    assert 'priority' not in json.loads((tmp_path/'PROTOCOL.json').read_text(encoding='utf-8'))
+    assert s.representative() is None
+
+
+def test_priority_weights_change_model_guided_proposals(tmp_path, monkeypatch):
+    import pareto_search.core as core
+
+    class TradeoffGP:
+        def __init__(self, **kwargs):
+            pass
+
+        def fit(self, x, y):
+            self.increasing = y[-1] > y[0]
+            return self
+
+        def predict(self, x, return_std=False):
+            mean = x[:, 0] if self.increasing else 1. - x[:, 0]
+            return mean, np.zeros(len(x))
+
+    monkeypatch.setattr(core, 'GaussianProcessRegressor', TradeoffGP)
+    options = dict(space={'x': dict(low=0., high=1.)}, objectives=['loss', 'cost'],
+                   seeds=[0, 1], budget=4, batch_size=4)
+    history = [dict(candidate=dict(params={'x': x}), objectives=options['objectives'],
+                    minimize=True, per_seed=[dict(seed=s, values=[x, 1.-x]) for s in options['seeds']])
+               for x in (0., .33, .67, 1.)]
+    proposed = []
+    for name, weights in [('loss', [.9, .1]), ('cost', [.1, .9])]:
+        search = Optimizer(tmp_path/name, **options, history=history,
+            priority=dict(levels=[[0], [1]], weights=weights, reference=[1., 1.], required_levels=0))
+        proposed.append(search.ask(4)[0]['params']['x'])
+    assert proposed[0] < .05
+    assert proposed[1] > .95

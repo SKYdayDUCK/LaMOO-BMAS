@@ -13,6 +13,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 from sklearn.svm import SVC
 from .storage import stable_hash, read_json, write_json, freeze_json
+from .priority import validate_priority, components as priority_components, order as priority_order
 
 
 def pareto_mask(y):
@@ -24,7 +25,7 @@ class Optimizer:
     def __init__(self, root, *, space, objectives, budget=64, batch_size=8,
                  seeds=(0, 1), history=None, target=None, scale=None,
                  groups=None, context=None, name='default', method='lamoo',
-                 run_budget=None, exit_reason=None):
+                 run_budget=None, exit_reason=None, priority=None):
         self.root = Path(root)
         self.space = copy.deepcopy(space)
         self.objectives = list(objectives)
@@ -52,6 +53,7 @@ class Optimizer:
         if not space or (method == 'grid' and len(space) != 1):
             raise ValueError('Provide a nonempty space; grid requires one axis')
         size = len(self.objectives)
+        self.priority = validate_priority(priority, size)
         self.target = np.array([0.]*size if target is None else target,dtype=float)
         self.scale = np.array([1.]*size if scale is None else scale,dtype=float)
         if self.target.shape != (size,) or self.scale.shape != (size,) or not np.isfinite(self.target).all() or not np.isfinite(self.scale).all() or np.any(self.scale <= 0):
@@ -65,6 +67,8 @@ class Optimizer:
             scale=self.scale.tolist(),groups=self.groups,context=context,name=name,method=method,
             run_budget=run_budget,exit_reason=exit_reason,
             history_sha256=stable_hash(history or []),version='pareto-search-v1')
+        if self.priority is not None:
+            protocol['priority'] = self.priority
         freeze_json(self.root/'PROTOCOL.json',protocol)
         self.path = self.root/'STATE.json'
         if self.path.exists():
@@ -159,6 +163,21 @@ class Optimizer:
         rows,_,values = self.training()
         return [dict(candidate=copy.deepcopy(rows[i]['candidate']),values=values[i].tolist()) for i in np.flatnonzero(pareto_mask(values))]
 
+    def representative(self):
+        """Return one complete observed configuration and its joint metrics."""
+        rows, _, values = self.training()
+        if not len(rows):
+            return None
+        if self.priority is None:
+            i = int(np.argmin(np.max((values-self.target)/self.scale, axis=1)))
+            return dict(candidate=copy.deepcopy(rows[i]['candidate']), values=values[i].tolist())
+        i = int(priority_order(values, self.priority)[0])
+        stats = priority_components(values, self.priority)
+        return dict(candidate=copy.deepcopy(rows[i]['candidate']), values=values[i].tolist(),
+                    tier=int(stats['tier'][i]), score=float(stats['score'][i]),
+                    levels_passed=stats['passed'][i].tolist(),
+                    contributions=stats['contributions'][i].tolist())
+
     def status(self):
         n,reason = self.allocation()
         return dict(status=reason,next_batch=n,reserved=len(self.state['reserved']),
@@ -179,8 +198,11 @@ class Optimizer:
             lo, hi = np.array(box['lo'])[cols], np.array(box['hi'])[cols]
             grid = qmc.Sobol(len(cols),scramble=True,seed=0).random_base2(12)*(hi-lo)+lo
             hv.append(float(np.mean(np.any(np.all(y[:,None,cols] <= grid[None,:,:],axis=2),axis=0))))
-        return dict(hv=hv, best=y.min(axis=0).tolist(), gap=float(np.min(np.max(y,axis=1))),
-                    reserved=len(self.state['reserved']))
+        result = dict(hv=hv, best=y.min(axis=0).tolist(), gap=float(np.min(np.max(y,axis=1))),
+                      reserved=len(self.state['reserved']))
+        if self.priority is not None:
+            result['representative'] = self.representative()
+        return result
 
     def training(self):
         rows = [r for r in self.state['observations'].values()
@@ -314,22 +336,41 @@ class Optimizer:
                 self.state['hv_box'] = initial
             lo, hi = np.array(initial['lo'])[columns], np.array(initial['hi'])[columns]
             grid = qmc.Sobol(len(columns), scramble=True, seed=0).random_base2(10) * (hi-lo) + lo
-            leaves = self._regions(x, y[:, columns], pool, grid)
+            if self.priority is None:
+                leaves = self._regions(x, y[:, columns], pool, grid)
+            else:
+                ranks = np.empty(len(rows))
+                ranks[priority_order(raw_y, self.priority)] = np.arange(len(rows))/max(1, len(rows)-1)
+                leaves = self._regions(x, ranks[:, None], pool,
+                    qmc.Sobol(1, scramble=True, seed=0).random_base2(10))
             region_slots = max(leaves, key=lambda r:r[0])[1] if leaves else np.arange(len(pool))
             # An SVM extrapolates indefinitely. Regional exploitation stays
             # near measured projected-front points; two global slots explore
             # the rest of the domain explicitly instead of mislabelling it.
-            front_x = x[pareto_mask(y[:, columns])]
+            front_columns = columns
+            if self.priority is not None:
+                levels = self.priority['levels'][:self.priority['required_levels']]
+                front_columns = [j for group in levels for j in group] or list(range(len(self.objectives)))
+            front_x = x[pareto_mask(y[:, front_columns])]
             nearby = np.min(np.linalg.norm(pool[:, None] - front_x[None, :], axis=2), axis=1) <= .25
             local_slots = region_slots[nearby[region_slots]]
             if len(local_slots) >= min(4, n):
                 region_slots = local_slots
+            # Keep exploration when experiments offer fewer than eight slots.
+            # 4 slots -> 2 local, 1 global objective gap, 1 global exploration.
+            local_count = max(1, n // 2)
+            gap_end = max(local_count, n - max(1, n // 4))
             for slot in range(n):
-                if slot < min(4, n):
+                preferred = self.priority is not None and slot < gap_end
+                if preferred:
+                    score = np.zeros(len(pool))
+                    allowed_slots = region_slots if slot < local_count else np.arange(len(pool))
+                    route = 'priority_partition_lcb' if slot < local_count else 'priority_global_lcb'
+                elif slot < local_count:
                     weights = rng.dirichlet(np.ones(len(columns)))
                     score = np.max(weights * lcb[:, columns], axis=1)
                     allowed_slots = region_slots; route = 'partition_lcb'
-                elif slot < min(6, n):
+                elif slot < gap_end:
                     score = np.max(lcb, axis=1); allowed_slots = np.arange(len(pool)); route = 'all_objective_gap'
                 else:
                     reference = np.vstack([x, pool[selected]])
@@ -341,7 +382,11 @@ class Optimizer:
                 valid = [i for i in allowed_slots if i not in selected]
                 if not valid:
                     valid = [i for i in range(len(pool)) if i not in selected]
-                index = min(valid, key=lambda i: score[i])
+                if preferred:
+                    prediction = self.target + self.scale * lcb[valid]
+                    index = valid[int(priority_order(prediction, self.priority, score[valid])[0])]
+                else:
+                    index = min(valid, key=lambda i: score[i])
                 selected.append(index); routes.append(route)
         proposals = [candidates[i] for i in selected]
         self.state['asked'] += 1
